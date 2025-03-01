@@ -5,10 +5,94 @@ const axios = require('axios');
 const { Builder, By, until } = require('selenium-webdriver');
 const chrome = require('selenium-webdriver/chrome');
 const mysql = require('mysql2/promise');
+const { API_KEYS, DB_CONFIG, SERVER_CONFIG, APP_CONFIG } = require('./config');
 const app = express();
 
-// Add near the top of the file, after imports
-const API_KEY = process.env.HYPERBOLIC_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJtZXphaW5tem5AZ21haWwuY29tIiwiaWF0IjoxNzM1NDAwMTA1fQ.gWCenzKcIrmd_3lvSpCPokbP6siW8DnnPH0BVfPAwCo';
+// Custom error classes for better error handling
+class DatabaseError extends Error {
+  constructor(message, originalError) {
+    super(message);
+    this.name = 'DatabaseError';
+    this.originalError = originalError;
+    this.code = originalError?.code;
+  }
+}
+
+class APIError extends Error {
+  constructor(message, statusCode, originalError) {
+    super(message);
+    this.name = 'APIError';
+    this.statusCode = statusCode || 500;
+    this.originalError = originalError;
+  }
+}
+
+// Error logger utility
+const logger = {
+  _getTimestamp() {
+    return new Date().toISOString();
+  },
+  
+  _formatError(error) {
+    return {
+      message: error.message || 'Unknown error',
+      name: error.name || 'Error',
+      stack: APP_CONFIG.isDev ? error.stack : undefined,
+      code: error.code,
+      statusCode: error.statusCode,
+      originalError: error.originalError ? this._formatError(error.originalError) : undefined
+    };
+  },
+  
+  info(message, meta = {}) {
+    console.log(`[${this._getTimestamp()}] [INFO] ${message}`, meta);
+  },
+  
+  warn(message, meta = {}) {
+    console.warn(`[${this._getTimestamp()}] [WARN] ${message}`, meta);
+  },
+  
+  error(message, error = null, meta = {}) {
+    const formattedError = error ? this._formatError(error) : null;
+    console.error(`[${this._getTimestamp()}] [ERROR] ${message}`, formattedError, meta);
+    
+    // In production, we could send this to a logging service
+    if (!APP_CONFIG.isDev) {
+      // Example: send to a logging service like CloudWatch, Sentry, etc.
+      // sendToLoggingService(message, formattedError, meta);
+    }
+  },
+  
+  request(req, res, start) {
+    const duration = Date.now() - start;
+    const log = {
+      method: req.method,
+      url: req.url,
+      status: res.statusCode,
+      duration: `${duration}ms`,
+      userAgent: req.headers['user-agent'],
+      ip: req.headers['x-forwarded-for'] || req.connection.remoteAddress
+    };
+    
+    if (res.statusCode >= 400) {
+      this.warn(`Request failed: ${req.method} ${req.url}`, log);
+    } else {
+      this.info(`Request completed: ${req.method} ${req.url}`, log);
+    }
+  }
+};
+
+// Request logging middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  logger.info(`Request started: ${req.method} ${req.url}`);
+  
+  res.on('finish', () => {
+    logger.request(req, res, start);
+  });
+  
+  next();
+});
 
 // MySQL Database Configuration
 const dbConfig = {
@@ -24,13 +108,16 @@ const dbConfig = {
 
 // Create MySQL connection pool
 let pool;
+let dbConnected = false;
+
 async function initializeDatabase() {
   try {
-    pool = mysql.createPool(dbConfig);
+    pool = mysql.createPool(DB_CONFIG);
     console.log('MySQL connection pool initialized');
     
     // Test connection and set up database schema if needed
     const connection = await pool.getConnection();
+    dbConnected = true;
     console.log('MySQL database connected!');
     
     // Create leads table if it doesn't exist
@@ -89,8 +176,10 @@ async function initializeDatabase() {
     }
     
     connection.release();
+    return true;
   } catch (error) {
     console.error('Error connecting to MySQL database or initializing schema:', error);
+    dbConnected = false;
     
     // Check for specific connection errors and provide more helpful messages
     if (error.code === 'ECONNREFUSED') {
@@ -110,22 +199,57 @@ async function initializeDatabase() {
       console.error('\x1b[31m%s\x1b[0m', '| Please create it before continuing.            |');
       console.error('\x1b[31m%s\x1b[0m', '---------------------------------------------------');
     }
+    
+    throw new DatabaseError('Database connection failed', error);
   }
 }
 
+// Database connection retry logic
+async function withDatabaseRetry(operation, maxRetries = 3, retryDelay = 2000) {
+  let lastError;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // If database is not connected, try to initialize it
+      if (!dbConnected) {
+        await initializeDatabase();
+      }
+      
+      // If we got here, we have a valid pool
+      return await operation(pool);
+    } catch (error) {
+      lastError = error;
+      console.error(`Database operation failed (attempt ${attempt}/${maxRetries}):`, error.message);
+      
+      // Only retry on connection errors, not on query errors
+      if (error.code && ['ECONNREFUSED', 'PROTOCOL_CONNECTION_LOST', 'ER_CON_COUNT_ERROR'].includes(error.code)) {
+        console.log(`Retrying database connection in ${retryDelay/1000} seconds...`);
+        await delay(retryDelay);
+        dbConnected = false; // Mark as disconnected to force reinitialization
+      } else {
+        // Don't retry on non-connection errors
+        break;
+      }
+    }
+  }
+  
+  // If we get here, all retries failed
+  throw new DatabaseError(`Database operation failed after ${maxRetries} attempts`, lastError);
+}
+
 // Initialize database connection
-initializeDatabase();
+initializeDatabase().catch(error => {
+  console.error('Failed to initialize database:', error);
+  // Don't exit the process, but log the error
+  // This allows the server to start even with DB issues, and retry connection later
+});
 
 // Add this near the top of the file
 const CACHE = {};
 
 // Use CORS with explicit configuration and JSON parser middleware
 app.use(
-  cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept'],
-  })
+  cors(SERVER_CONFIG.cors)
 );
 // Ensure OPTIONS requests are handled
 app.options('*', cors());
@@ -134,6 +258,35 @@ app.use(express.json());
 
 // Add this utility function near the top
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Health check endpoint
+app.get('/api/v1/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    version: process.env.npm_package_version || '1.0.0',
+    environment: APP_CONFIG.env
+  });
+});
+
+// Add a utility for consistent error responses
+const sendErrorResponse = (res, error) => {
+  if (error instanceof APIError) {
+    logger.warn(`API Error: ${error.message}`, { statusCode: error.statusCode });
+    return res.status(error.statusCode).json({
+      error: error.message,
+      status: 'error',
+      timestamp: new Date().toISOString()
+    });
+  }
+  
+  logger.error('Internal server error', error);
+  return res.status(500).json({
+    error: APP_CONFIG.isDev ? error.message : 'An internal server error occurred',
+    status: 'error',
+    timestamp: new Date().toISOString()
+  });
+};
 
 // POST endpoint for analyzing SEO articles using AI for theme extraction
 app.post('/api/v1/analyze', async (req, res) => {
@@ -145,8 +298,7 @@ app.post('/api/v1/analyze', async (req, res) => {
     const { article } = req.body;
 
     if (!article || article.trim() === '') {
-      console.error(`[${new Date().toISOString()}] Error: No article provided`);
-      return res.status(400).json({ error: 'No article provided' });
+      throw new APIError('No article provided', 400);
     }
 
     console.log(`[${new Date().toISOString()}] Raw article: ${article}`);
@@ -154,9 +306,9 @@ app.post('/api/v1/analyze', async (req, res) => {
     // Generate a simple cache key
     const cacheKey = `analyze_${Buffer.from(article).toString('base64').substring(0, 32)}`;
     
-    // Check cache
+    // Check cache first
     if (CACHE[cacheKey]) {
-      console.log(`[${new Date().toISOString()}] Returning cached result for analyze endpoint`);
+      console.log(`[${new Date().toISOString()}] Cache hit for analysis request`);
       return res.json(CACHE[cacheKey]);
     }
 
@@ -184,7 +336,7 @@ ${article}`;
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${API_KEY}`
+          'Authorization': `Bearer ${API_KEYS.HYPERBOLIC}`
         },
         body: JSON.stringify(dataLLM)
       }),
@@ -295,7 +447,7 @@ ${article}`;
     const websiteResponse = await axios.post("https://api.hyperbolic.xyz/v1/chat/completions", dataWebsites, {
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${API_KEY}`
+        "Authorization": `Bearer ${API_KEYS.HYPERBOLIC}`
       }
     });
     const websiteListText = websiteResponse.data.choices[0].message.content;
@@ -392,11 +544,7 @@ ${article}`;
     const result = CACHE[cacheKey];
     return res.json(result);
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error in /api/v1/analyze endpoint:`, error);
-    return res.status(500).json({ 
-      error: 'An error occurred while processing your request',
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    return sendErrorResponse(res, error);
   }
 });
 
@@ -582,8 +730,7 @@ app.post('/api/v1/backlinks', async (req, res) => {
       emails: scrapedEmails
     });
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error fetching backlink opportunities: ${error.message}`);
-    res.status(500).json({ error: 'Failed to get backlink opportunities' });
+    return sendErrorResponse(res, error);
   }
 });
 
@@ -626,8 +773,7 @@ app.post('/api/v1/scrape', async (req, res) => {
     console.log(`[${new Date().toISOString()}] Scraped emails:`, uniqueEmails);
     res.json({ emails: uniqueEmails });
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error scraping URL:`, error.message);
-    res.status(500).json({ error: 'Failed to scrape the website' });
+    return sendErrorResponse(res, error);
   }
 });
 
@@ -704,8 +850,7 @@ app.post('/api/v1/crawl', async (req, res) => {
       emails: scrapedEmails
     });
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error during crawl:`, error.message);
-    res.status(500).json({ error: 'Failed to crawl the internet for websites and emails' });
+    return sendErrorResponse(res, error);
   }
 });
 
@@ -738,7 +883,7 @@ app.post('/api/v1/related-websites', async (req, res) => {
     const deepseekResponse = await axios.post("https://api.hyperbolic.xyz/v1/chat/completions", dataTL, {
       headers: {
         "Content-Type": "application/json",
-        "Authorization": API_KEY
+        "Authorization": API_KEYS.HYPERBOLIC
       }
     });
 
@@ -749,8 +894,7 @@ app.post('/api/v1/related-websites', async (req, res) => {
     console.log(`[${new Date().toISOString()}] Related websites:`, websites);
     res.json({ subjects, websites });
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error fetching related websites:`, error.message);
-    res.status(500).json({ error: 'Failed to fetch related websites.' });
+    return sendErrorResponse(res, error);
   }
 });
 
@@ -808,8 +952,7 @@ app.post('/api/v1/linkedin', async (req, res) => {
 
     res.json({ linkedinProfiles: results });
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error scraping LinkedIn profiles: ${error.message}`);
-    res.status(500).json({ error: 'Failed to scrape LinkedIn profiles' });
+    return sendErrorResponse(res, error);
   } finally {
     if (driver) {
       try {
@@ -912,7 +1055,7 @@ ${article}`;
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${API_KEY}`
+          'Authorization': `Bearer ${API_KEYS.HYPERBOLIC}`
         },
         body: JSON.stringify(dataLLM)
       }),
@@ -1026,8 +1169,7 @@ ${article}`;
     return res.json(scoringResult);
     
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error in copy scoring:`, error);
-    res.status(500).json({ error: 'Failed to score copy: ' + error.message });
+    return sendErrorResponse(res, error);
   }
 });
 
@@ -1106,8 +1248,7 @@ app.post('/api/v1/search-leads', async (req, res) => {
       if (connection) connection.release();
     }
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error:`, error);
-    return res.status(500).json({ error: 'Server error', details: error.message });
+    return sendErrorResponse(res, error);
   }
 });
 
@@ -1162,24 +1303,107 @@ app.post('/api/v1/search-leads-simple', async (req, res) => {
     
     return res.json({ leads: rows });
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error searching leads:`, error);
-    return res.status(500).json({ error: 'Server error', details: error.message });
+    return sendErrorResponse(res, error);
+  }
+});
+
+// Endpoint to search for leads
+app.get('/api/v1/leads/search', async (req, res) => {
+  try {
+    const { industry, search } = req.query;
+    console.log(`[${new Date().toISOString()}] Searching leads with industry: ${industry}, search: ${search}`);
+    
+    // Build the SQL query based on provided filters
+    let sql = 'SELECT * FROM leads WHERE 1=1';
+    const params = [];
+    
+    if (industry && industry !== 'all') {
+      sql += ' AND industry = ?';
+      params.push(industry);
+    }
+    
+    if (search && search.trim() !== '') {
+      sql += ' AND (first_name LIKE ? OR last_name LIKE ? OR company_name LIKE ? OR email LIKE ?)';
+      const searchTerm = `%${search}%`;
+      params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+    }
+    
+    sql += ' ORDER BY created_at DESC LIMIT 100';
+    
+    // Use the retry mechanism for database operations
+    const result = await withDatabaseRetry(async (db) => {
+      const [rows] = await db.query(sql, params);
+      return rows;
+    });
+    
+    return res.json({ leads: result });
+  } catch (error) {
+    return sendErrorResponse(res, error);
   }
 });
 
 // Add near the end, before starting the server
 app.use((err, req, res, next) => {
   console.error(`[${new Date().toISOString()}] Unhandled error:`, err);
-  res.status(500).json({ 
-    error: 'An unexpected error occurred', 
-    details: process.env.NODE_ENV === 'production' ? null : err.message 
+  
+  // Don't expose error details in production
+  const message = APP_CONFIG.isDev ? err.message : 'An unexpected error occurred';
+  
+  res.status(err.statusCode || 500).json({
+    error: message,
+    status: 'error',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// 404 handler - this should be defined after all other routes
+app.use((req, res) => {
+  res.status(404).json({
+    error: `Endpoint not found: ${req.method} ${req.path}`,
+    status: 'error',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Global Error Handlers for uncaught exceptions and promise rejections
+process.on('uncaughtException', (error) => {
+  logger.error('UNCAUGHT EXCEPTION! 💥 Shutting down...', error);
+  console.error('UNCAUGHT EXCEPTION! 💥', error.name, error.message);
+  
+  // Exit with error in production
+  // In development, we might choose to keep running
+  if (!APP_CONFIG.isDev) {
+    process.exit(1);
+  }
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('UNHANDLED REJECTION! 💥', { reason });
+  console.error('UNHANDLED REJECTION! 💥', reason);
+  
+  // Exit with error in production
+  // In development, we might choose to keep running
+  if (!APP_CONFIG.isDev) {
+    process.exit(1);
+  }
+});
+
+// Add a graceful shutdown handler
+process.on('SIGTERM', () => {
+  logger.info('👋 SIGTERM RECEIVED. Shutting down gracefully');
+  console.log('👋 SIGTERM RECEIVED. Shutting down gracefully');
+  
+  // Close the server
+  server.close(() => {
+    logger.info('💥 Process terminated!');
   });
 });
 
 // Start the backend server on port 5005 (change as needed)
-const PORT = process.env.PORT || 5005;
+const PORT = SERVER_CONFIG.port;
 const server = app.listen(PORT, () => {
-  console.log(`[${new Date().toISOString()}] Server running on port ${PORT}`);
+  logger.info(`Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
 
 // Add an error handler to catch EADDRINUSE and prompt the user
